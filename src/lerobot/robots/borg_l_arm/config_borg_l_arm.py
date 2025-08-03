@@ -20,7 +20,7 @@ class BorgLArmConfig(RobotConfig):
     max_relative_target: int | None = None
     
     cameras: dict[str, CameraConfig] = field(
-        default_factory={
+        default_factory=lambda: {
             "cam_1": OpenCVCameraConfig(
                 index_or_path=2,
                 fps=30,
