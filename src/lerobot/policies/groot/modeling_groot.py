@@ -56,14 +56,18 @@ class GrootPolicy(PreTrainedPolicy):
     name = "groot"
     config_class = GrootConfig
 
-    def __init__(self, config: GrootConfig, **kwargs):
+    def __init__(self, config: GrootConfig, *, _skip_groot_init: bool = False, **kwargs):
         """Initialize Groot policy wrapper."""
         super().__init__(config)
         config.validate_features()
         self.config = config
 
         # Initialize GR00T model using ported components
-        self._groot_model = self._create_groot_model()
+        # Skip when loading from a fine-tuned checkpoint (weights are loaded separately)
+        if not _skip_groot_init:
+            self._groot_model = self._create_groot_model()
+        else:
+            self._groot_model = None
 
         self.reset()
 
@@ -147,9 +151,16 @@ class GrootPolicy(PreTrainedPolicy):
         is_finetuned_checkpoint = False
 
         # Check if this is a fine-tuned LeRobot checkpoint (has model.safetensors)
+        # The model.safetensors can be at the root level or in a pretrained_model subdirectory
         try:
             if os.path.isdir(model_id):
+                # Check root level first
                 is_finetuned_checkpoint = os.path.exists(os.path.join(model_id, SAFETENSORS_SINGLE_FILE))
+                # Also check pretrained_model subdirectory
+                if not is_finetuned_checkpoint:
+                    is_finetuned_checkpoint = os.path.exists(
+                        os.path.join(model_id, "pretrained_model", SAFETENSORS_SINGLE_FILE)
+                    )
             else:
                 # Try to download the safetensors file to check if it exists
                 try:
@@ -170,21 +181,58 @@ class GrootPolicy(PreTrainedPolicy):
             is_finetuned_checkpoint = False
 
         if is_finetuned_checkpoint:
-            # This is a fine-tuned LeRobot checkpoint - use parent class loading
+            # This is a fine-tuned LeRobot checkpoint - load manually
             print("Detected fine-tuned LeRobot checkpoint, loading with state dict...")
-            return super().from_pretrained(
-                pretrained_name_or_path=pretrained_name_or_path,
-                config=config,
-                force_download=force_download,
-                resume_download=resume_download,
-                proxies=proxies,
-                token=token,
-                cache_dir=cache_dir,
-                local_files_only=local_files_only,
-                revision=revision,
-                strict=strict,
-                **kwargs,
-            )
+
+            # Determine the correct path for loading config and weights
+            # The config.json and model.safetensors are in a pretrained_model subdirectory
+            checkpoint_path = Path(pretrained_name_or_path)
+            pretrained_model_dir = checkpoint_path / "pretrained_model"
+
+            # Load config from checkpoint if not provided
+            if config is None:
+                # The config.json in pretrained_model has a "type" field that draccus doesn't accept
+                # So we need to manually load it and strip that field
+                import json
+                config_file = pretrained_model_dir / "config.json" if pretrained_model_dir.exists() else checkpoint_path / "config.json"
+                with open(config_file) as f:
+                    config_dict = json.load(f)
+
+                # Remove the "type" field that draccus doesn't accept
+                config_dict.pop("type", None)
+
+                # Deserialize input/output features from plain dicts to PolicyFeature objects
+                for features_key in ("input_features", "output_features"):
+                    raw = config_dict.get(features_key)
+                    if raw and isinstance(raw, dict):
+                        config_dict[features_key] = {
+                            name: PolicyFeature(
+                                type=FeatureType(feat["type"]),
+                                shape=tuple(feat["shape"]),
+                            )
+                            for name, feat in raw.items()
+                        }
+
+                config = GrootConfig(**config_dict)
+
+            # Create policy instance with full GR00T model architecture (downloads base model)
+            instance = cls(config)
+
+            # Load fine-tuned weights over the base model
+            from huggingface_hub.constants import SAFETENSORS_SINGLE_FILE
+            from safetensors.torch import load_model as load_model_as_safetensor
+            from lerobot.policies.utils import log_model_loading_keys
+
+            model_file = pretrained_model_dir / SAFETENSORS_SINGLE_FILE if pretrained_model_dir.exists() else checkpoint_path / SAFETENSORS_SINGLE_FILE
+            if not model_file.exists():
+                raise FileNotFoundError(f"Model file not found: {model_file}")
+
+            missing_keys, unexpected_keys = load_model_as_safetensor(instance, model_file, strict=strict)
+            log_model_loading_keys(missing_keys, unexpected_keys)
+
+            instance.to(config.device)
+            instance.eval()
+            return instance
 
         # This is a base GR00T model - load it fresh
         print("Detected base GR00T model, loading from HuggingFace...")
