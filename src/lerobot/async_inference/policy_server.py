@@ -30,6 +30,7 @@ import threading
 import time
 from concurrent import futures
 from dataclasses import asdict
+from pathlib import Path
 from pprint import pformat
 from queue import Empty, Queue
 from typing import Any
@@ -105,6 +106,15 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         with self._predicted_timesteps_lock:
             self._predicted_timesteps = set()
 
+        # Free old model to avoid CUDA OOM when the next client sends new policy instructions
+        if self.policy is not None:
+            self.policy.cpu()
+            del self.policy
+            self.policy = None
+            self.preprocessor = None
+            self.postprocessor = None
+            torch.cuda.empty_cache()
+
     def Ready(self, request, context):  # noqa: N802
         client_id = context.peer()
         self.logger.info(f"Client {client_id} connected and ready")
@@ -152,11 +162,17 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.policy = policy_class.from_pretrained(policy_specs.pretrained_name_or_path)
         self.policy.to(self.device)
 
-        # Load preprocessor and postprocessor, overriding device to match requested device
+        # Load preprocessor and postprocessor, overriding device to match requested device.
+        # Processor configs may live under pretrained_model/ (e.g. Groot checkpoints).
+        processor_path = Path(policy_specs.pretrained_name_or_path)
+        pretrained_model_dir = processor_path / "pretrained_model"
+        if (pretrained_model_dir / "policy_preprocessor.json").is_file():
+            processor_path = pretrained_model_dir
+
         device_override = {"device": self.device}
         self.preprocessor, self.postprocessor = make_pre_post_processors(
             self.policy.config,
-            pretrained_path=policy_specs.pretrained_name_or_path,
+            pretrained_path=str(processor_path),
             preprocessor_overrides={
                 "device_processor": device_override,
                 "rename_observations_processor": {"rename_map": policy_specs.rename_map},

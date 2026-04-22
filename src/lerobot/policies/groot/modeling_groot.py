@@ -149,10 +149,15 @@ class GrootPolicy(PreTrainedPolicy):
         model_id = str(pretrained_name_or_path)
         is_finetuned_checkpoint = False
 
-        # Check if this is a fine-tuned LeRobot checkpoint (has model.safetensors)
+        # Check if this is a fine-tuned LeRobot checkpoint (has model.safetensors).
+        # save_checkpoint() nests files under a pretrained_model/ subdirectory, so resolve that first.
         try:
             if os.path.isdir(model_id):
-                is_finetuned_checkpoint = os.path.exists(os.path.join(model_id, SAFETENSORS_SINGLE_FILE))
+                pretrained_subdir = os.path.join(model_id, "pretrained_model")
+                if os.path.isfile(os.path.join(pretrained_subdir, SAFETENSORS_SINGLE_FILE)):
+                    model_id = pretrained_subdir
+                    pretrained_name_or_path = pretrained_subdir
+                is_finetuned_checkpoint = os.path.isfile(os.path.join(model_id, SAFETENSORS_SINGLE_FILE))
             else:
                 # Try to download the safetensors file to check if it exists
                 try:
