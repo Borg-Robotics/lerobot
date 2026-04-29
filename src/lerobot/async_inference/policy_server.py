@@ -25,6 +25,7 @@ python -m lerobot.async_inference.policy_server \
 """
 
 import logging
+import math
 import pickle  # nosec
 import threading
 import time
@@ -39,14 +40,24 @@ import draccus
 import grpc
 import torch
 
+from lerobot.configs import RTCAttentionSchedule
 from lerobot.policies import get_policy_class, make_pre_post_processors
-from lerobot.processor import PolicyProcessorPipeline
+from lerobot.policies.rtc import RTCConfig
+from lerobot.processor import (
+    NormalizerProcessorStep,
+    PolicyProcessorPipeline,
+    RelativeActionsProcessorStep,
+    TransitionKey,
+    create_transition,
+    to_relative_actions,
+)
 from lerobot.transport import (
     services_pb2,  # type: ignore
     services_pb2_grpc,  # type: ignore
 )
 from lerobot.transport.utils import receive_bytes_in_chunks
 from lerobot.types import PolicyAction
+from lerobot.utils.constants import OBS_STATE
 
 from .configs import PolicyServerConfig
 from .constants import SUPPORTED_POLICIES
@@ -89,6 +100,16 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]] | None = None
         self.postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction] | None = None
 
+        # RTC state (server-side cache: see plan B'). All None / False on
+        # non-RTC policies (groot, act, ...). Repopulated at handshake time.
+        self._last_original_chunk: torch.Tensor | None = None
+        self._last_processed_chunk: torch.Tensor | None = None
+        self._last_chunk_first_timestep: int | None = None
+        self._rtc_active: bool = False
+        self._rtc_relative: bool = False
+        self._rtc_relative_step: RelativeActionsProcessorStep | None = None
+        self._rtc_normalizer_step: NormalizerProcessorStep | None = None
+
     @property
     def running(self):
         return not self.shutdown_event.is_set()
@@ -114,6 +135,15 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             self.preprocessor = None
             self.postprocessor = None
             torch.cuda.empty_cache()
+
+        # Clear RTC cache; it will be repopulated by the next SendPolicyInstructions.
+        self._last_original_chunk = None
+        self._last_processed_chunk = None
+        self._last_chunk_first_timestep = None
+        self._rtc_active = False
+        self._rtc_relative = False
+        self._rtc_relative_step = None
+        self._rtc_normalizer_step = None
 
     def Ready(self, request, context):  # noqa: N802
         client_id = context.peer()
@@ -184,7 +214,68 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         self.logger.info(f"Time taken to put policy on {self.device}: {end - start:.4f} seconds")
 
+        self._configure_rtc(policy_specs)
+
         return services_pb2.Empty()
+
+    def _configure_rtc(self, policy_specs: RemotePolicyConfig) -> None:
+        """Wire up RTC on the just-loaded policy if the client requested it
+        and the policy supports it. No-op for groot/act/etc."""
+        rtc_enabled = getattr(policy_specs, "rtc_enabled", False)
+        if not rtc_enabled:
+            self.logger.info("RTC inactive (rtc_enabled=False on client config)")
+            return
+
+        if not hasattr(self.policy, "init_rtc_processor"):
+            self.logger.warning(
+                f"RTC requested but policy_type={self.policy_type} does not support RTC; "
+                "falling through to non-RTC inference."
+            )
+            return
+
+        schedule_name = getattr(policy_specs, "rtc_prefix_attention_schedule", "EXP")
+        try:
+            schedule = RTCAttentionSchedule[schedule_name]
+        except KeyError as e:
+            raise ValueError(
+                f"Unknown rtc_prefix_attention_schedule={schedule_name!r}. "
+                f"Expected one of {[s.name for s in RTCAttentionSchedule]}."
+            ) from e
+
+        self.policy.config.rtc_config = RTCConfig(
+            enabled=True,
+            execution_horizon=getattr(policy_specs, "rtc_execution_horizon", 10),
+            max_guidance_weight=getattr(policy_specs, "rtc_max_guidance_weight", 10.0),
+            prefix_attention_schedule=schedule,
+        )
+        # init_rtc_processor() rebuilds self.policy.rtc_processor from the new config
+        # and propagates the reference into nested model modules (see modeling_pi05.py).
+        self.policy.init_rtc_processor()
+        self._rtc_active = True
+
+        # Detect relative-action policies by walking the preprocessor pipeline.
+        # Same pattern as examples/rtc/eval_with_real_robot.py:323-330.
+        self._rtc_relative_step = next(
+            (
+                s
+                for s in self.preprocessor.steps
+                if isinstance(s, RelativeActionsProcessorStep) and getattr(s, "enabled", False)
+            ),
+            None,
+        )
+        self._rtc_normalizer_step = next(
+            (s for s in self.preprocessor.steps if isinstance(s, NormalizerProcessorStep)),
+            None,
+        )
+        self._rtc_relative = self._rtc_relative_step is not None
+
+        self.logger.info(
+            f"RTC active | "
+            f"{'relative' if self._rtc_relative else 'absolute'} actions | "
+            f"execution_horizon={self.policy.config.rtc_config.execution_horizon} | "
+            f"max_guidance_weight={self.policy.config.rtc_config.max_guidance_weight} | "
+            f"prefix_attention_schedule={schedule.name}"
+        )
 
     def SendObservations(self, request_iterator, context):  # noqa: N802
         """Receive observations from the robot client"""
@@ -335,13 +426,98 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             for i, action in enumerate(action_chunk)
         ]
 
-    def _get_action_chunk(self, observation: dict[str, torch.Tensor]) -> torch.Tensor:
-        """Get an action chunk from the policy. The chunk contains only"""
-        chunk = self.policy.predict_action_chunk(observation)
+    def _get_action_chunk(
+        self,
+        observation: dict[str, torch.Tensor],
+        observation_t: TimedObservation,
+    ) -> torch.Tensor:
+        """Get an action chunk from the policy.
+
+        On the RTC path we additionally cache the original (pre-postprocess)
+        chunk so the next call can use its tail as the prefix guidance.
+        """
+        kwargs = self._build_rtc_kwargs(observation, observation_t)
+        chunk = self.policy.predict_action_chunk(observation, **kwargs)
         if chunk.ndim != 3:
             chunk = chunk.unsqueeze(0)  # adding batch dimension, now shape is (B, chunk_size, action_dim)
 
-        return chunk[:, : self.actions_per_chunk, :]
+        chunk = chunk[:, : self.actions_per_chunk, :]
+
+        if self._rtc_active:
+            # chunk[0] is (chunk_size, action_dim) in policy space (pre-postprocess).
+            self._last_original_chunk = chunk[0].detach().clone()
+            self._last_chunk_first_timestep = observation_t.get_timestep()
+
+        return chunk
+
+    def _build_rtc_kwargs(
+        self,
+        observation: dict[str, torch.Tensor],
+        observation_t: TimedObservation,
+    ) -> dict[str, Any]:
+        """Compute kwargs to forward to predict_action_chunk for RTC.
+
+        Returns an empty dict on the non-RTC path (groot/act, or pi05 with
+        rtc_enabled=False, or the very first inference call after handshake).
+        """
+        if not self._rtc_active or self._last_original_chunk is None:
+            return {}
+
+        consumed = max(0, observation_t.get_timestep() - (self._last_chunk_first_timestep or 0))
+
+        if self._rtc_relative:
+            # Relative-action policies: re-anchor the cached *absolute* tail
+            # against the current robot state, then renormalize.
+            if self._last_processed_chunk is None:
+                return {}
+            tail_abs = self._last_processed_chunk[consumed:]
+            if tail_abs.numel() == 0 or OBS_STATE not in observation:
+                return {}
+            tail = self._reanchor_relative_rtc_prefix(
+                prev_actions_absolute=tail_abs,
+                current_state=observation[OBS_STATE],
+            )
+        else:
+            tail = self._last_original_chunk[consumed:]
+            if tail.numel() == 0:
+                return {}
+
+        latency_s = float(getattr(observation_t, "inference_latency_seconds", 0.0) or 0.0)
+        inference_delay = max(0, math.ceil(latency_s / self.config.environment_dt))
+
+        self.logger.debug(
+            f"RTC kwargs | inference_delay={inference_delay} (latency={latency_s * 1000:.2f}ms) | "
+            f"prev_chunk_left_over.shape={tuple(tail.shape)}"
+        )
+
+        return {
+            "prev_chunk_left_over": tail,
+            "inference_delay": inference_delay,
+        }
+
+    def _reanchor_relative_rtc_prefix(
+        self,
+        prev_actions_absolute: torch.Tensor,
+        current_state: torch.Tensor,
+    ) -> torch.Tensor:
+        """Convert absolute leftover actions back into model (relative+normalized) space.
+
+        Ported from examples/rtc/eval_with_real_robot.py:243-269. Used only when
+        the preprocessor pipeline contains an enabled `RelativeActionsProcessorStep`.
+        """
+        state = current_state.detach().cpu()
+        if state.dim() == 1:
+            state = state.unsqueeze(0)
+
+        action_cpu = prev_actions_absolute.detach().cpu()
+        mask = self._rtc_relative_step._build_mask(action_cpu.shape[-1])
+        relative_actions = to_relative_actions(action_cpu, state, mask)
+
+        transition = create_transition(action=relative_actions)
+        if self._rtc_normalizer_step is not None:
+            transition = self._rtc_normalizer_step(transition)
+
+        return transition[TransitionKey.ACTION].to(self.device)
 
     def _predict_action_chunk(self, observation_t: TimedObservation) -> list[TimedAction]:
         """Predict an action chunk based on an observation.
@@ -370,7 +546,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         """3. Get action chunk"""
         start_inference = time.perf_counter()
-        action_tensor = self._get_action_chunk(observation)
+        action_tensor = self._get_action_chunk(observation, observation_t)
         inference_time = time.perf_counter() - start_inference
         self.logger.info(
             f"Preprocessing and inference took {inference_time:.4f}s, action shape: {action_tensor.shape}"
@@ -396,6 +572,13 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.logger.debug(f"Postprocessed action shape: {action_tensor.shape}")
 
         action_tensor = action_tensor.detach().cpu()
+
+        # Cache the postprocessed (absolute) chunk for relative-action RTC. The
+        # next inference call slices its tail and re-anchors it against the
+        # current robot state. Absolute-action policies use the original
+        # (pre-postprocess) chunk cached in `_get_action_chunk` instead.
+        if self._rtc_active and self._rtc_relative:
+            self._last_processed_chunk = action_tensor.clone()
 
         """5. Convert to TimedAction list"""
         action_chunk = self._time_action_chunk(

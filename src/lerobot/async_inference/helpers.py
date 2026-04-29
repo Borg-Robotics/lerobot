@@ -229,6 +229,10 @@ class TimedAction(TimedData):
 class TimedObservation(TimedData):
     observation: RawObservation
     must_go: bool = False
+    # End-to-end RTT (obs send → action chunk receive) measured by the client and
+    # forwarded to the server so RTC can derive an `inference_delay` in steps.
+    # Defaults to 0.0 so observations pickled by older clients deserialize cleanly.
+    inference_latency_seconds: float = 0.0
 
     def get_observation(self):
         return self.observation
@@ -270,6 +274,12 @@ class RemotePolicyConfig:
     actions_per_chunk: int
     device: str = "cpu"
     rename_map: dict[str, str] = field(default_factory=dict)
+    # RTC handshake fields. Old clients pickle without these; the server
+    # treats their absence (via getattr) as rtc_enabled=False.
+    rtc_enabled: bool = False
+    rtc_execution_horizon: int = 10
+    rtc_max_guidance_weight: float = 10.0
+    rtc_prefix_attention_schedule: str = "EXP"
 
 
 def _compare_observation_states(obs1_state: torch.Tensor, obs2_state: torch.Tensor, atol: float) -> bool:

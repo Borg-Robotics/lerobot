@@ -49,6 +49,7 @@ import torch
 
 from lerobot.cameras.opencv import OpenCVCameraConfig  # noqa: F401
 from lerobot.cameras.realsense import RealSenseCameraConfig  # noqa: F401
+from lerobot.policies.rtc import LatencyTracker
 from lerobot.robots import (  # noqa: F401
     Robot,
     RobotConfig,
@@ -106,6 +107,10 @@ class RobotClient:
             lerobot_features,
             config.actions_per_chunk,
             config.policy_device,
+            rtc_enabled=config.rtc_enabled,
+            rtc_execution_horizon=config.rtc_execution_horizon,
+            rtc_max_guidance_weight=config.rtc_max_guidance_weight,
+            rtc_prefix_attention_schedule=config.rtc_prefix_attention_schedule,
         )
         self.channel = grpc.insecure_channel(
             self.server_address, grpc_channel_options(initial_backoff=f"{config.environment_dt:.4f}s")
@@ -129,6 +134,12 @@ class RobotClient:
 
         # FPS measurement
         self.fps_tracker = FPSTracker(target_fps=self.config.fps)
+
+        # End-to-end RTT tracker. Server uses the p95 percentile to choose
+        # `inference_delay` (in chunk steps) for RTC.
+        self._latency_tracker = LatencyTracker(maxlen=20)
+        self._inflight_obs: dict[int, float] = {}
+        self._inflight_obs_lock = threading.Lock()
 
         self.logger.info("Robot connected and ready")
 
@@ -192,6 +203,10 @@ class RobotClient:
         if not isinstance(obs, TimedObservation):
             raise ValueError("Input observation needs to be a TimedObservation!")
 
+        # Attach the most recent p95 RTT estimate so the server can compute
+        # `inference_delay` for RTC. Returns 0.0 until enough samples accumulate.
+        obs.inference_latency_seconds = float(self._latency_tracker.percentile(0.95) or 0.0)
+
         start_time = time.perf_counter()
         observation_bytes = pickle.dumps(obs)
         serialize_time = time.perf_counter() - start_time
@@ -204,8 +219,10 @@ class RobotClient:
                 log_prefix="[CLIENT] Observation",
                 silent=True,
             )
-            _ = self.stub.SendObservations(observation_iterator)
             obs_timestep = obs.get_timestep()
+            with self._inflight_obs_lock:
+                self._inflight_obs[obs_timestep] = time.perf_counter()
+            _ = self.stub.SendObservations(observation_iterator)
             self.logger.debug(f"Sent observation #{obs_timestep} | ")
 
             return True
@@ -290,6 +307,22 @@ class RobotClient:
                 if len(timed_actions) > 0:
                     received_device = timed_actions[0].get_action().device.type
                     self.logger.debug(f"Received actions on device: {received_device}")
+
+                    # Measure end-to-end RTT for the matching observation so the
+                    # server can pick a sensible RTC inference_delay next round.
+                    obs_timestep = timed_actions[0].get_timestep()
+                    with self._inflight_obs_lock:
+                        send_time = self._inflight_obs.pop(obs_timestep, None)
+                        # Drop any stale (older) inflight entries.
+                        for ts in [t for t in self._inflight_obs if t < obs_timestep]:
+                            self._inflight_obs.pop(ts, None)
+                    if send_time is not None:
+                        rtt = time.perf_counter() - send_time
+                        self._latency_tracker.add(rtt)
+                        self.logger.debug(
+                            f"Measured RTT for obs #{obs_timestep}: {rtt * 1000:.2f}ms "
+                            f"(p95={self._latency_tracker.percentile(0.95) * 1000:.2f}ms)"
+                        )
 
                 # Move actions to client_device (e.g., for downstream planners that need GPU)
                 client_device = self.config.client_device
